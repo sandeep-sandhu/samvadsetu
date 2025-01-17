@@ -9,7 +9,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::{fmt, thread};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use config::Config;
+use config;
+use config::{Config, ConfigBuilder, FileFormat};
 use log::{debug, error, info};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -30,8 +31,8 @@ pub struct LLMTextGenerator {
     pub fetch_timeout: u64,
     pub overwrite_existing_value: bool,
     pub save_intermediate: bool,
-    pub avg_tokens_per_word: f32,
-    pub model_temperature: f32,
+    pub avg_tokens_per_word: f64,
+    pub model_temperature: f64,
     pub prompt: String,
     pub max_tok_gen: usize,
     pub model_name: String,
@@ -80,7 +81,7 @@ impl LLMTextGenerator {
         return llm_output;
     }
 
-    fn http_api_request(&self, client: &Client, complete_prompt_input: String) -> Result<LlmApiResult, String> {
+    pub fn http_api_request(&self, client: &Client, complete_prompt_input: String) -> Result<LlmApiResult, String> {
         // create payload based on api service type:
         match self.llm_service.as_str() {
             "chatgpt" => {
@@ -231,9 +232,78 @@ impl LLMTextGenBuilder {
             }
         }
     }
+
+
+    pub fn build_from_config(app_confg: &Config, llm_svc_name: &str) -> Option<LLMTextGenerator> {
+
+        let api_access_mutex = Arc::new(Mutex::new(0));
+        // specify default values:
+        if let Some(mut llm_gen) = LLMTextGenBuilder::build(
+            llm_svc_name,
+            "",
+            60,
+            None,
+            Some(api_access_mutex)
+        ) {
+            let config_table = app_confg.get_table("llm_apis").unwrap();
+
+            if let Some((llm_name, llm_val)) = config_table.get_key_value(llm_svc_name) {
+                match llm_val.clone().into_table(){
+                    Ok(entry_table) => {
+                        match entry_table.get("max_gen_tokens") {
+                            None => {}
+                            Some(max_gen_tokens_val) => {
+                                llm_gen.max_tok_gen = max(0,max_gen_tokens_val.clone().into_int().unwrap_or_default()) as usize;
+                            }
+                        }
+                        match entry_table.get("max_context_len"){
+                            None => {}
+                            Some(max_context_len_val) => {
+                                llm_gen.num_context = max(0,max_context_len_val.clone().into_int().unwrap_or_default()) as usize;
+                            }
+                        }
+                        match entry_table.get("min_gap_btwn_rqsts_secs"){
+                            None => {}
+                            Some(min_gap_btwn_rqsts_secs_val) => {
+                                llm_gen.min_gap_btwn_rqsts_secs = max(0,min_gap_btwn_rqsts_secs_val.clone().into_int().unwrap_or_default()) as u64;
+                            }
+                        }
+                        match entry_table.get("temperature"){
+                            None => {}
+                            Some(temperature_val) => {
+                                llm_gen.model_temperature = temperature_val.clone().into_float().unwrap_or_default();
+                            }
+                        }
+                        match entry_table.get("api_url"){
+                            None => {}
+                            Some(api_url_val) => {
+                                llm_gen.svc_base_url = api_url_val.clone().into_string().unwrap_or_default();
+                            }
+                        }
+                        match entry_table.get("model_name"){
+                            None => {}
+                            Some(model_name_val) => {
+                                llm_gen.model_name = model_name_val.clone().into_string().unwrap_or_default();
+                            }
+                        }
+                        match entry_table.get("model_api_timeout") {
+                            None => {}
+                            Some(model_api_timeout_val) => {
+                                llm_gen.fetch_timeout = max(0,model_api_timeout_val.clone().into_int().unwrap_or_default()) as u64;
+                            }
+                        }
+                        return Some( llm_gen );
+                    },
+                    Err(er) => {
+                        error!("{}", er.to_string());
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
 }
-
-
 
 
 pub fn build_llm_api_client(connect_timeout: u64, fetch_timeout: u64, proxy_url: Option<String>, custom_headers: Option<HeaderMap>) -> reqwest::blocking::Client {

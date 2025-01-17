@@ -152,13 +152,6 @@ mod tests {
             println!("---Answer 1---\n{:?}", llm_response);
             assert_eq!(true, true);
         }
-
-        // let answer3 = llmgen.generate_text("", "Prove maxwells equations analytically. Reply very concisely.");
-        // println!("Response from ollama model = {:?}", answer3);
-        // let answer2 = llmgen.generate_text("", "Why is the sky blue? Respond very concisely.");
-        // println!("Response from ollama model = {:?}", answer2);
-        assert_eq!(1,0);
-
     }
 
 }
