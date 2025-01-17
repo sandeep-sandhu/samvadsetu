@@ -1,4 +1,6 @@
-# samvadsetu
+# samvadsetu | संवाद-सेतु
+
+Simple LLM API for commonly used LLM services including Gemini, ChatGPT, and Ollama. The name implies a bridge for dialogue since the library facilitates communication and interaction between a programs logic and the large language models capabilities. The sanskrit word saṃvāda (संवाद) refers to dialogue, and setu (सेतु) means bridge.
 
 [![Crates.io](https://img.shields.io/crates/v/samvadsetu.svg)](https://crates.io/crates/samvadsetu)
 [![Docs.rs](https://docs.rs/samvadsetu/badge.svg)](https://docs.rs/samvadsetu)
@@ -14,14 +16,9 @@
 
 ## License
 
-Licensed under either of
-
- * Apache License, Version 2.0
+Licensed under Apache License, Version 2.0
    ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
- * MIT license
-   ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
-at your option.
 
 ## Contribution
 
