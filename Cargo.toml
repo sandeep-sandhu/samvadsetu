@@ -1,0 +1,11 @@
+[package]
+name = "samvadsetu"
+version = "0.1.0"
+edition = "2021"
+description = "Simple LLM API for commonly used LLM services including Gemini, ChatGPT, and Ollama. Tthe name implies a bridge for dialogue since the library facilitates communication and interaction between a programs logic and the large language models capabilities. The sanskrit word saṃvāda (संवाद) refers to dialogue, and setu (सेतु) means bridge."
+repository = "https://github.com/sandeep-sandhu/samvadsetu"
+license = "MIT OR Apache-2.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
