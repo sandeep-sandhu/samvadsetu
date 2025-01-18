@@ -1,12 +1,11 @@
-use std::cmp::max;
-use std::collections::HashMap;
-use std::error::Error;
+use crate::llm::{LLMTextGenerator, LlmApiResult};
 use log::{debug, error, info};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use crate::llm::{LLMTextGenBuilder, LLMTextGenerator, LlmApiResult};
+use std::collections::HashMap;
+use std::error::Error;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChatGPTRequestPayload {
@@ -17,7 +16,6 @@ pub struct ChatGPTRequestPayload {
     logprobs: bool,
 }
 
-
 /// Prepare custom headers for OpenAI's ChatGPT API
 ///
 /// # Arguments
@@ -26,7 +24,6 @@ pub struct ChatGPTRequestPayload {
 ///
 /// returns: HeaderMap<HeaderValue>
 pub fn prepare_chatgpt_headers(api_key: String) -> HeaderMap {
-
     let mut custom_headers = HeaderMap::new();
 
     // set header "Authorization: Bearer $OPENAI_API_KEY"
@@ -42,7 +39,7 @@ pub fn prepare_chatgpt_headers(api_key: String) -> HeaderMap {
     //     custom_headers.insert(proj_id, header_val);
     // }
 
-    return custom_headers;
+    custom_headers
 }
 
 /// Generate payload of the format:
@@ -57,28 +54,28 @@ pub fn prepare_chatgpt_headers(api_key: String) -> HeaderMap {
 /// * `llm_params`: The LLMParameters object with relevant parameters to be used.
 ///
 /// returns: ChatGPTRequestPayload
-pub fn prepare_chatgpt_payload(prompt: String, llm_params: &LLMTextGenerator) -> ChatGPTRequestPayload {
-
+pub fn prepare_chatgpt_payload(
+    prompt: String,
+    llm_params: &LLMTextGenerator,
+) -> ChatGPTRequestPayload {
     // put the parameters into the structure
-    let json_payload = ChatGPTRequestPayload {
+    ChatGPTRequestPayload {
         model: llm_params.model_name.clone(),
         messages: vec![
             HashMap::from([
                 ("role".to_string(), "system".to_string()),
-                ("content".to_string(), llm_params.system_context.clone())
+                ("content".to_string(), llm_params.system_context.clone()),
             ]),
             HashMap::from([
                 ("role".to_string(), "user".to_string()),
-                ("content".to_string(), prompt)
+                ("content".to_string(), prompt),
             ]),
         ],
-        temperature: llm_params.model_temperature as f64,
+        temperature: llm_params.model_temperature,
         max_completion_tokens: llm_params.max_tok_gen,
         logprobs: true,
-    };
-    return json_payload;
+    }
 }
-
 
 /// Posts the json payload to REST service and retrieves back the result.
 ///
@@ -89,12 +86,17 @@ pub fn prepare_chatgpt_payload(prompt: String, llm_params: &LLMTextGenerator) ->
 /// * `json_payload`:
 ///
 /// returns: String
-pub fn http_post_json_chatgpt(llm_params: &LLMTextGenerator, client: &Client, json_payload: ChatGPTRequestPayload) -> Result<LlmApiResult, String>{
-
+pub fn http_post_json_chatgpt(
+    llm_params: &LLMTextGenerator,
+    client: &Client,
+    json_payload: ChatGPTRequestPayload,
+) -> Result<LlmApiResult, String> {
     // add json payload to body
-    match client.post(llm_params.svc_base_url.clone())
+    match client
+        .post(llm_params.svc_base_url.clone())
         .json(&json_payload)
-        .send() {
+        .send()
+    {
         Ok(resp) => {
             match resp.status() {
                 StatusCode::OK => {
@@ -115,9 +117,15 @@ pub fn http_post_json_chatgpt(llm_params: &LLMTextGenerator, client: &Client, js
                                             match logprobs_content.as_array() {
                                                 None => {}
                                                 Some(logprobs_vec) => {
-                                                    for log_prob_obj in logprobs_vec{
-                                                        if let Some(logprob_val) = log_prob_obj.get("logprob") {
-                                                            llm_response.logprobs.push(logprob_val.as_f64().unwrap_or_default());
+                                                    for log_prob_obj in logprobs_vec {
+                                                        if let Some(logprob_val) =
+                                                            log_prob_obj.get("logprob")
+                                                        {
+                                                            llm_response.logprobs.push(
+                                                                logprob_val
+                                                                    .as_f64()
+                                                                    .unwrap_or_default(),
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -125,7 +133,9 @@ pub fn http_post_json_chatgpt(llm_params: &LLMTextGenerator, client: &Client, js
                                         }
                                     }
                                     // "finish_reason": String("stop")
-                                    if let Some(finish_reason_val) = first_choice.get("finish_reason") {
+                                    if let Some(finish_reason_val) =
+                                        first_choice.get("finish_reason")
+                                    {
                                         llm_response.stop_reason = finish_reason_val.to_string();
                                     }
                                 }
@@ -137,78 +147,93 @@ pub fn http_post_json_chatgpt(llm_params: &LLMTextGenerator, client: &Client, js
                             // "usage" -> get integer attributes: "prompt_tokens", "completion_tokens"
                             if let Some(usage_val) = json.get("usage") {
                                 if let Some(prompt_tokens_val) = usage_val.get("prompt_tokens") {
-                                    llm_response.input_tokens_count = prompt_tokens_val.to_string().parse::<u64>().unwrap_or_default();
+                                    llm_response.input_tokens_count = prompt_tokens_val
+                                        .to_string()
+                                        .parse::<u64>()
+                                        .unwrap_or_default();
                                 }
-                                if let Some(completion_tokens_val) = usage_val.get("completion_tokens") {
-                                    llm_response.output_tokens_count = completion_tokens_val.to_string().parse::<u64>().unwrap_or_default();
+                                if let Some(completion_tokens_val) =
+                                    usage_val.get("completion_tokens")
+                                {
+                                    llm_response.output_tokens_count = completion_tokens_val
+                                        .to_string()
+                                        .parse::<u64>()
+                                        .unwrap_or_default();
                                 }
                             }
                             return Ok(llm_response);
-                        },
+                        }
                         Err(e) => {
                             error!("ChatGPT API: When retrieving json from response: {}", e);
                             if let Some(err_source) = e.source() {
                                 error!("Caused by: {}", err_source);
-                                return LlmApiResult::error(format!("ChatGPT error When retrieving json: {}, caused by: {}", e, err_source));
+                                return LlmApiResult::error(format!(
+                                    "ChatGPT error When retrieving json: {}, caused by: {}",
+                                    e, err_source
+                                ));
                             }
                             info!("ChatGPT Payload that resulted in error: {:?}", json_payload);
-                        },
+                        }
                     }
-                },
+                }
                 StatusCode::NOT_FOUND => {
                     error!("ChatGPT API: Service not found!");
                     return LlmApiResult::error("ChatGPT API: Service not found".to_string());
-                },
+                }
                 StatusCode::PAYLOAD_TOO_LARGE => {
                     error!("ChatGPT API: Request payload is too large!");
-                    return LlmApiResult::error("ChatGPT API: Request payload is too large".to_string());
-                },
+                    return LlmApiResult::error(
+                        "ChatGPT API: Request payload is too large".to_string(),
+                    );
+                }
                 StatusCode::TOO_MANY_REQUESTS => {
                     error!("ChatGPT API: Too many requests. Exceeded the Provisioned Throughput.");
-                    return LlmApiResult::error("ChatGPT API: Too many requests. Exceeded the Provisioned Throughput.".to_string());
+                    return LlmApiResult::error(
+                        "ChatGPT API: Too many requests. Exceeded the Provisioned Throughput."
+                            .to_string(),
+                    );
                 }
                 s => {
                     error!("ChatGPT API: Received response status: {s:?}");
-                    return LlmApiResult::error(
-                        format!(
-                            "ChatGPT API: Received response status: {s:?}"
-                        )
-                    );
+                    return LlmApiResult::error(format!(
+                        "ChatGPT API: Received response status: {s:?}"
+                    ));
                 }
             }
         }
         Err(e) => {
             error!("ChatGPT API: When posting json payload to service: {}", e);
-            if let Some(err_source) = e.source(){
+            if let Some(err_source) = e.source() {
                 error!("Caused by: {}", err_source);
-                return LlmApiResult::error(
-                    format!(
-                        "ChatGPT API: When posting json payload to service error {}, caused by: {}",
-                        e,
-                        err_source)
-                );
+                return LlmApiResult::error(format!(
+                    "ChatGPT API: When posting json payload to service error {}, caused by: {}",
+                    e, err_source
+                ));
             }
             info!("ChatGPT Payload: {:?}", json_payload);
         }
     }
-    return LlmApiResult::error("ChatGPT API: did not generate any text".to_string());
+    LlmApiResult::error("ChatGPT API: did not generate any text".to_string())
 }
-
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use log::{debug, info, error};
+    use crate::llm::LLMTextGenBuilder;
 
     #[test]
-    fn test_generate_using_chatgpt_llm(){
-        let mut llmgen = LLMTextGenBuilder::build("chatgpt", "gpt-4o-mini",60, None, None).unwrap();
+    fn test_generate_using_chatgpt_llm() {
+        let mut llmgen =
+            LLMTextGenBuilder::build("chatgpt", "gpt-4o-mini", 60, None, None).unwrap();
         llmgen.max_tok_gen = 16000;
-        let answer1 = llmgen.generate_text("", "How is a rainbow created in the sky? Respond very concisely.");
+        /* Disabling since automated CI/CD pipelines do not have network access and fail the test:
+        let answer1 = llmgen.generate_text(
+            "",
+            "How is a rainbow created in the sky? Respond very concisely.",
+        );
         if let Ok(llm_response) = answer1 {
             println!("---Answer 1---\n{:?}", llm_response);
         }
+        */
         assert_eq!(true, true);
     }
-
 }
