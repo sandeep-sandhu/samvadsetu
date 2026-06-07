@@ -1,171 +1,250 @@
-// file: llm.rs
+// llm.rs — core generator struct, builder, and HTTP client factory
 
-#![allow(unused_imports)]
-#![warn(clippy::unwrap_used)]
-#![warn(clippy::get_unwrap)]
-#![warn(clippy::manual_unwrap_or)]
-#![warn(clippy::manual_unwrap_or_default)]
-#![warn(clippy::map_unwrap_or)]
-#![warn(clippy::option_env_unwrap)]
-#![warn(clippy::or_then_unwrap)]
-#![warn(clippy::panicking_unwrap)]
-#![warn(clippy::unnecessary_literal_unwrap)]
-#![warn(clippy::unnecessary_unwrap)]
-#![warn(clippy::unwrap_in_result)]
-#![warn(clippy::unwrap_used)]
-
-use crate::providers::google::{
-    http_post_json_gemini, http_post_json_google_genai, prepare_gemini_api_payload,
-    prepare_google_genai_api_payload, prepare_googlegenai_headers,
+use crate::error::SamvadSetuError;
+use crate::providers::{anthropic, google, ollama, openai};
+use crate::types::{
+    BatchHandle, BatchRequest, BatchRequestResult, ChatMessage, LlmApiResult, ResponseFormat,
+    ToolDefinition,
 };
-use crate::providers::ollama::{http_post_json_ollama, prepare_ollama_payload};
-use crate::providers::openai::{
-    http_post_json_chatgpt, prepare_chatgpt_headers, prepare_chatgpt_payload,
-};
-use config;
 use config::Config;
-use log::{debug, error, info};
-use reqwest;
+use log::{error, info};
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{fmt, thread};
+use std::thread;
 
+// ── Default base URLs ─────────────────────────────────────────────────────────
+
+pub const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
+pub const DEEPSEEK_API_URL: &str = "https://api.deepseek.com/chat/completions";
+/// Default is Singapore region; override via config `api_url` or `svc_base_url`.
+pub const QWEN_API_URL: &str =
+    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+pub const LLAMACPP_API_URL: &str = "http://127.0.0.1:8080/v1/chat/completions";
+pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+pub const GEMINI_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+pub const OLLAMA_CHAT_URL: &str = "http://127.0.0.1:11434/api/chat";
+
+/// Minimum enforced gap between successive requests to the same API key
+/// when `shared_lock` rate-limiting is enabled.
 pub const MIN_GAP_BTWN_RQST_SECS: u64 = 6;
 
+// ── Generator struct ──────────────────────────────────────────────────────────
+
+/// A configured LLM API client for a specific provider and model.
+///
+/// Build one with [`LLMTextGenBuilder::build`] or
+/// [`LLMTextGenBuilder::build_from_config`], then call [`generate_text`] as
+/// many times as needed.  The struct is intentionally stateless with respect
+/// to conversation history — callers own and pass the full `messages` slice on
+/// every call.
+///
+/// [`generate_text`]: LLMTextGenerator::generate_text
 #[derive(Debug)]
 pub struct LLMTextGenerator {
+    /// Provider identifier: "chatgpt", "deepseek", "qwen", "llamacpp",
+    /// "claude", "gemini", "google_genai", "ollama".
     pub llm_service: String,
+
+    /// Pre-configured blocking HTTP client (with auth headers attached).
     pub api_client: reqwest::blocking::Client,
+
+    /// API key stored as a query-string parameter (legacy Gemini only).
+    /// For all other providers the key is embedded in the client headers.
     pub api_key: String,
+
+    /// Request timeout in seconds (0 = use the client's built-in timeout).
     pub fetch_timeout: u64,
-    pub overwrite_existing_value: bool,
-    pub save_intermediate: bool,
-    pub avg_tokens_per_word: f64,
+
+    /// Sampling temperature (0.0 = deterministic, 1.0+ = creative).
     pub model_temperature: f64,
-    pub user_prompt: String,
+
+    /// Maximum tokens to generate per call.
     pub max_tok_gen: usize,
+
+    /// Model identifier string sent to the API.
     pub model_name: String,
+
+    /// Context-window length (mainly used by Ollama).
     pub num_context: usize,
+
+    /// Base URL of the API service.
     pub svc_base_url: String,
-    pub system_context: String,
-    pub input_tokens_count: u64,
-    pub output_tokens_count: u64,
+
+    /// Optional default system prompt.  If `None`, callers should include a
+    /// `ChatMessage::system(…)` in the messages slice instead.
+    pub system_prompt: Option<String>,
+
+    /// Shared mutex for rate-limiting across threads.  The stored value is a
+    /// UNIX timestamp (seconds) of the last successful request.
     pub shared_lock: Option<Arc<Mutex<isize>>>,
+
+    /// Minimum gap (seconds) between requests when `shared_lock` is active.
     pub min_gap_btwn_rqsts_secs: u64,
 }
 
 impl LLMTextGenerator {
+    /// Generate a completion for the given conversation.
+    ///
+    /// * `messages` – Full conversation history (include a
+    ///   [`ChatMessage::system`] entry if you want a system prompt).
+    /// * `tools` – Optional tool definitions the model may call.
+    /// * `response_format` – Optional structured-output specification.
+    ///
+    /// When `shared_lock` is set, calls are serialised and rate-limited.
     pub fn generate_text(
         &self,
-        context_prefix: &str,
-        context_suffix: &str,
-    ) -> Result<LlmApiResult, String> {
-        if let Some(api_access_mutex) = self.shared_lock.clone() {
-            // attempt lock, retrieve value of mutux
-            if let Ok(mut shared_val) = api_access_mutex.lock() {
-                // then execute llm service call,
-                let result = self.generate_text_no_mutex(context_prefix, context_suffix);
-                let duration_previous = Duration::from_secs(max(*shared_val, 0) as u64);
-                // get current timestamp:
-                let mut duration_now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default();
-                let seconds_elapsed = (duration_now - duration_previous).as_secs();
-                // check if current tiemstamp is more than given duration from mutex value,
-                if seconds_elapsed < self.min_gap_btwn_rqsts_secs {
-                    // add delay in seconds to make up for the remaining time:
-                    println!("API accessed {} seconds ago, hence waiting for {} seconds to limit API requests/sec", seconds_elapsed, self.min_gap_btwn_rqsts_secs-seconds_elapsed);
-                    thread::sleep(Duration::from_secs(
-                        self.min_gap_btwn_rqsts_secs - seconds_elapsed,
-                    ));
+        messages: &[ChatMessage],
+        tools: Option<&[ToolDefinition]>,
+        response_format: Option<&ResponseFormat>,
+    ) -> Result<LlmApiResult, SamvadSetuError> {
+        if let Some(lock) = self.shared_lock.clone() {
+            match lock.lock() {
+                Ok(mut last_ts) => {
+                    let result = self.generate_text_inner(messages, tools, response_format);
+                    // Enforce minimum gap between requests.
+                    let now_secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let elapsed = now_secs.saturating_sub(max(*last_ts, 0) as u64);
+                    if elapsed < self.min_gap_btwn_rqsts_secs {
+                        let wait = self.min_gap_btwn_rqsts_secs - elapsed;
+                        thread::sleep(Duration::from_secs(wait));
+                    }
+                    *last_ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as isize;
+                    result
                 }
-                // set current timestamp and then return
-                duration_now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default();
-                *shared_val = duration_now.as_secs() as isize;
-                result
-            }else{
-                Err("Unable to access the shared lock for the API Service.".to_string())
+                Err(_) => Err(SamvadSetuError::Network(
+                    "Rate-limit mutex is poisoned".to_string(),
+                )),
             }
         } else {
-            self.generate_text_no_mutex(context_prefix, context_suffix)
+            self.generate_text_inner(messages, tools, response_format)
         }
     }
 
-    /// Generates text using the llm service.
-    /// This version of the functiondoes not use a shared mutex lock to coordinate access to the
-    /// LLM API
-    ///
-    /// # Arguments
-    ///
-    /// * `context_prefix`: The part of the context that needs to be prefixed to the user prompt.
-    ///   Pass an empty string in case a prefix is not required.
-    /// * `context_suffix`: The context that follows the user prompt
-    ///
-    /// returns: Result<LlmApiResult, String>
-    pub fn generate_text_no_mutex(
+    /// Internal dispatch — no rate-limit mutex.
+    pub fn generate_text_inner(
         &self,
-        context_prefix: &str,
-        context_suffix: &str,
-    ) -> Result<LlmApiResult, String> {
-
-        let prompt = format!("{}\n{}\n{}", context_prefix, self.user_prompt, context_suffix);
-
-        self.http_api_request(&(self.api_client), prompt)
-    }
-
-    pub fn http_api_request(
-        &self,
-        client: &reqwest::blocking::Client,
-        complete_prompt_input: String,
-    ) -> Result<LlmApiResult, String> {
-        // create payload based on api service type:
+        messages: &[ChatMessage],
+        tools: Option<&[ToolDefinition]>,
+        response_format: Option<&ResponseFormat>,
+    ) -> Result<LlmApiResult, SamvadSetuError> {
         match self.llm_service.as_str() {
-            "chatgpt" => {
-                let json_payload = prepare_chatgpt_payload(complete_prompt_input, self);
-                http_post_json_chatgpt(self, client, json_payload)
+            "chatgpt" | "openai" | "deepseek" | "qwen" | "llamacpp" => {
+                openai::http_post_openai_compat(
+                    self,
+                    &self.api_client,
+                    messages,
+                    tools,
+                    response_format,
+                )
             }
-            "gemini" => {
-                let json_payload = prepare_gemini_api_payload(complete_prompt_input, self);
-                http_post_json_gemini(self, client, json_payload)
-            }
+            "claude" | "anthropic" => anthropic::http_post_anthropic(
+                self,
+                &self.api_client,
+                messages,
+                tools,
+            ),
+            "gemini" => google::http_post_gemini(self, &self.api_client, messages, tools),
             "google_genai" => {
-                let json_payload = prepare_google_genai_api_payload(complete_prompt_input, self);
-                http_post_json_google_genai(self, client, json_payload)
+                google::http_post_google_genai(self, &self.api_client, messages, tools, response_format)
             }
             "ollama" => {
-                let json_payload = prepare_ollama_payload(complete_prompt_input, self);
-                http_post_json_ollama(self, client, json_payload)
+                ollama::http_post_chat_ollama(self, &self.api_client, messages, tools, response_format)
             }
-            _ => Err(format!("Unknown LLM service: {}", self.llm_service)),
+            unknown => Err(SamvadSetuError::Config(format!(
+                "Unknown LLM service: '{unknown}'. Valid values: chatgpt, openai, deepseek, \
+                 qwen, llamacpp, claude, anthropic, gemini, google_genai, ollama"
+            ))),
+        }
+    }
+
+    // ── Batch helpers ─────────────────────────────────────────────────────────
+
+    /// Submit a batch of requests (OpenAI or Anthropic only).
+    ///
+    /// Returns a [`BatchHandle`] that can be polled with [`check_batch_status`]
+    /// and retrieved with [`retrieve_batch_results`].
+    ///
+    /// [`check_batch_status`]: LLMTextGenerator::check_batch_status
+    /// [`retrieve_batch_results`]: LLMTextGenerator::retrieve_batch_results
+    pub fn submit_batch(
+        &self,
+        requests: Vec<BatchRequest>,
+    ) -> Result<BatchHandle, SamvadSetuError> {
+        match self.llm_service.as_str() {
+            "chatgpt" | "openai" | "deepseek" | "qwen" => {
+                crate::batch::openai::submit_batch(self, &self.api_client, requests)
+            }
+            "claude" | "anthropic" => {
+                crate::batch::anthropic::submit_batch(self, &self.api_client, requests)
+            }
+            svc => Err(SamvadSetuError::UnsupportedFeature {
+                provider: svc.to_string(),
+                feature: "batch API".to_string(),
+            }),
+        }
+    }
+
+    /// Poll the status of a previously submitted batch.
+    pub fn check_batch_status(
+        &self,
+        handle: &BatchHandle,
+    ) -> Result<BatchHandle, SamvadSetuError> {
+        match self.llm_service.as_str() {
+            "chatgpt" | "openai" | "deepseek" | "qwen" => {
+                crate::batch::openai::get_batch_status(self, &self.api_client, handle)
+            }
+            "claude" | "anthropic" => {
+                crate::batch::anthropic::get_batch_status(self, &self.api_client, handle)
+            }
+            svc => Err(SamvadSetuError::UnsupportedFeature {
+                provider: svc.to_string(),
+                feature: "batch API".to_string(),
+            }),
+        }
+    }
+
+    /// Download results for a completed batch.
+    pub fn retrieve_batch_results(
+        &self,
+        handle: &BatchHandle,
+    ) -> Result<Vec<BatchRequestResult>, SamvadSetuError> {
+        match self.llm_service.as_str() {
+            "chatgpt" | "openai" | "deepseek" | "qwen" => {
+                crate::batch::openai::retrieve_batch_results(self, &self.api_client, handle)
+            }
+            "claude" | "anthropic" => {
+                crate::batch::anthropic::retrieve_batch_results(self, &self.api_client, handle)
+            }
+            svc => Err(SamvadSetuError::UnsupportedFeature {
+                provider: svc.to_string(),
+                feature: "batch API".to_string(),
+            }),
         }
     }
 }
 
-pub struct LLMTextGenBuilder {
-    pub llm_gen: LLMTextGenerator,
-}
+// ── Builder ───────────────────────────────────────────────────────────────────
+
+pub struct LLMTextGenBuilder;
 
 impl LLMTextGenBuilder {
-    /// Builds an instance of LLMTextGenerator if successful, or None if an error occurs.
+    /// Build a generator with sensible defaults for the given provider.
     ///
     /// # Arguments
     ///
-    /// * `llm_api_name`:
-    /// * `model_name`:
-    /// * `network_timeout_secs`:
-    ///
-    /// returns: Option<LLMTextGenerator>
-    ///
-    /// # Examples
-    ///
-    /// ```
-    ///
-    /// ```
+    /// * `llm_api_name`         – Provider name (see [`LLMTextGenerator::llm_service`]).
+    /// * `model_name`           – Model identifier to send in requests.
+    /// * `network_timeout_secs` – Seconds before a request times out.
+    /// * `proxy_server`         – Optional HTTPS proxy URL.
+    /// * `api_access_mutex`     – Optional shared mutex for cross-thread rate-limiting.
     pub fn build(
         llm_api_name: &str,
         model_name: &str,
@@ -173,240 +252,165 @@ impl LLMTextGenBuilder {
         proxy_server: Option<String>,
         api_access_mutex: Option<Arc<Mutex<isize>>>,
     ) -> Option<LLMTextGenerator> {
-
-        match llm_api_name {
-
-            "chatgpt" => {
-                let api_key = std::env::var("OPENAI_API_KEY").unwrap_or(String::from(""));
-                let chatgpt_headers = prepare_chatgpt_headers(api_key);
-                let client: reqwest::blocking::Client = build_llm_api_client(
-                    network_timeout_secs,
-                    network_timeout_secs,
-                    proxy_server,
-                    Some(chatgpt_headers),
-                );
-                Some(LLMTextGenerator {
-                    llm_service: llm_api_name.to_string(),
-                    api_client: client,
-                    api_key: "".to_string(),
-                    fetch_timeout: 0,
-                    overwrite_existing_value: false,
-                    save_intermediate: false,
-                    avg_tokens_per_word: 1.3,
-                    model_temperature: 0.0,
-                    user_prompt: "".to_string(),
-                    max_tok_gen: 8192,
-                    model_name: model_name.to_string(),
-                    num_context: 8192,
-                    svc_base_url: "https://api.openai.com/v1/chat/completions".to_string(),
-                    system_context: "You are an expert".to_string(),
-                    input_tokens_count: 0,
-                    output_tokens_count: 0,
-                    shared_lock: api_access_mutex,
-                    min_gap_btwn_rqsts_secs: 6,
-                })
-            },
-
-            "google_genai" => {
-                let api_key = std::env::var("GOOGLE_API_KEY").unwrap_or(String::from(""));
-                let googlegenai_headers = prepare_googlegenai_headers(api_key);
-                let client: reqwest::blocking::Client = build_llm_api_client(
-                    network_timeout_secs,
-                    network_timeout_secs,
-                    proxy_server,
-                    Some(googlegenai_headers),
-                );
-                Some(LLMTextGenerator {
-                    llm_service: llm_api_name.to_string(),
-                    api_client: client,
-                    api_key: "".to_string(),
-                    fetch_timeout: 0,
-                    overwrite_existing_value: false,
-                    save_intermediate: false,
-                    avg_tokens_per_word: 1.3,
-                    model_temperature: 0.0,
-                    user_prompt: "".to_string(),
-                    max_tok_gen: 8192,
-                    model_name: model_name.to_string(),
-                    num_context: 8192,
-                    svc_base_url: "https://generativelanguage.googleapis.com/v1beta/models"
-                        .to_string(),
-                    system_context: "You are an expert".to_string(),
-                    input_tokens_count: 0,
-                    output_tokens_count: 0,
-                    shared_lock: api_access_mutex,
-                    min_gap_btwn_rqsts_secs: 6,
-                })
-            },
-
+        let (svc_url, api_key, custom_headers, min_gap) = match llm_api_name {
+            "chatgpt" | "openai" => {
+                let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                let headers = openai::prepare_bearer_headers(&key);
+                (OPENAI_API_URL.to_string(), String::new(), Some(headers), MIN_GAP_BTWN_RQST_SECS)
+            }
+            "deepseek" => {
+                let key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
+                let headers = openai::prepare_bearer_headers(&key);
+                (DEEPSEEK_API_URL.to_string(), String::new(), Some(headers), MIN_GAP_BTWN_RQST_SECS)
+            }
+            "qwen" => {
+                let key = std::env::var("DASHSCOPE_API_KEY").unwrap_or_default();
+                let headers = openai::prepare_bearer_headers(&key);
+                (QWEN_API_URL.to_string(), String::new(), Some(headers), MIN_GAP_BTWN_RQST_SECS)
+            }
+            "llamacpp" => {
+                // llama.cpp server usually needs no auth; allow override via env.
+                let key = std::env::var("LLAMACPP_API_KEY").unwrap_or_default();
+                let headers = if key.is_empty() {
+                    None
+                } else {
+                    Some(openai::prepare_bearer_headers(&key))
+                };
+                (LLAMACPP_API_URL.to_string(), String::new(), headers, 0)
+            }
+            "claude" | "anthropic" => {
+                let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+                let headers = anthropic::prepare_anthropic_headers(&key);
+                (ANTHROPIC_API_URL.to_string(), String::new(), Some(headers), MIN_GAP_BTWN_RQST_SECS)
+            }
             "gemini" => {
-                let api_key = std::env::var("GOOGLE_API_KEY").unwrap_or(String::from(""));
-                let client: reqwest::blocking::Client = build_llm_api_client(
-                    network_timeout_secs,
-                    network_timeout_secs,
-                    proxy_server,
-                    None,
-                );
-                Some(LLMTextGenerator {
-                    llm_service: llm_api_name.to_string(),
-                    api_client: client,
-                    api_key,
-                    fetch_timeout: 0,
-                    overwrite_existing_value: false,
-                    save_intermediate: false,
-                    avg_tokens_per_word: 1.3,
-                    model_temperature: 0.0,
-                    user_prompt: "".to_string(),
-                    max_tok_gen: 8192,
-                    model_name: model_name.to_string(),
-                    num_context: 8192,
-                    svc_base_url: "https://generativelanguage.googleapis.com/v1beta/models"
-                        .to_string(),
-                    system_context: "You are an expert".to_string(),
-                    input_tokens_count: 0,
-                    output_tokens_count: 0,
-                    shared_lock: api_access_mutex,
-                    min_gap_btwn_rqsts_secs: 6,
-                })
-            },
-
+                let key = std::env::var("GOOGLE_API_KEY").unwrap_or_default();
+                // For legacy Gemini the key goes in the URL as ?key=…
+                (GEMINI_API_URL.to_string(), key, None, MIN_GAP_BTWN_RQST_SECS)
+            }
+            "google_genai" => {
+                let key = std::env::var("GOOGLE_API_KEY").unwrap_or_default();
+                let headers = google::prepare_googlegenai_headers(&key);
+                (GEMINI_API_URL.to_string(), String::new(), Some(headers), MIN_GAP_BTWN_RQST_SECS)
+            }
             "ollama" => {
-                let client: reqwest::blocking::Client = build_llm_api_client(
-                    network_timeout_secs,
-                    network_timeout_secs,
-                    proxy_server,
-                    None,
-                );
-                Some(LLMTextGenerator {
-                    llm_service: llm_api_name.to_string(),
-                    api_client: client,
-                    api_key: "".to_string(),
-                    fetch_timeout: 0,
-                    overwrite_existing_value: false,
-                    save_intermediate: false,
-                    avg_tokens_per_word: 1.3,
-                    model_temperature: 0.0,
-                    user_prompt: "".to_string(),
-                    max_tok_gen: 8192,
-                    model_name: model_name.to_string(),
-                    num_context: 8192,
-                    svc_base_url: "http://127.0.0.1:11434/api/generate".to_string(),
-                    system_context: "You are an expert".to_string(),
-                    input_tokens_count: 0,
-                    output_tokens_count: 0,
-                    shared_lock: api_access_mutex,
-                    min_gap_btwn_rqsts_secs: 0,
-                })
+                (OLLAMA_CHAT_URL.to_string(), String::new(), None, 0)
             }
-            _ => {
-                None
-            }
-        }
+            _ => return None,
+        };
+
+        let client = build_llm_api_client(
+            network_timeout_secs,
+            network_timeout_secs,
+            proxy_server,
+            custom_headers,
+        );
+
+        Some(LLMTextGenerator {
+            llm_service: llm_api_name.to_string(),
+            api_client: client,
+            api_key,
+            fetch_timeout: network_timeout_secs,
+            model_temperature: 0.0,
+            max_tok_gen: 8192,
+            model_name: model_name.to_string(),
+            num_context: 8192,
+            svc_base_url: svc_url,
+            system_prompt: None,
+            shared_lock: api_access_mutex,
+            min_gap_btwn_rqsts_secs: min_gap,
+        })
     }
 
-    pub fn build_from_config(app_confg: &Config, llm_svc_name: &str) -> Option<LLMTextGenerator> {
+    /// Build a generator from a `config::Config` object.
+    ///
+    /// Reads from the `[llm_apis."<name>"]` table.  Supported keys:
+    /// `model_name`, `api_url`, `temperature`, `max_gen_tokens`,
+    /// `max_context_len`, `min_gap_btwn_rqsts_secs`, `model_api_timeout`,
+    /// `system_prompt`.
+    pub fn build_from_config(app_config: &Config, llm_svc_name: &str) -> Option<LLMTextGenerator> {
+        let mutex = Arc::new(Mutex::new(0));
+        let mut llm_gen = LLMTextGenBuilder::build(llm_svc_name, "", 60, None, Some(mutex))?;
 
-        let api_access_mutex = Arc::new(Mutex::new(0));
-
-        // start with a generator with default values:
-        if let Some(mut llm_gen) =
-            LLMTextGenBuilder::build(llm_svc_name, "", 60, None, Some(api_access_mutex))
-        {
-            if let Ok(config_table) = app_confg.get_table("llm_apis") {
-                if let Some((llm_name, llm_val)) = config_table.get_key_value(llm_svc_name) {
-                    info!("Loading LLM text generation configuration from entry: {}", llm_name);
-                    match llm_val.clone().into_table() {
-                        Ok(entry_table) => {
-                            match entry_table.get("max_gen_tokens") {
-                                None => {}
-                                Some(max_gen_tokens_val) => {
-                                    llm_gen.max_tok_gen = max(
-                                        0,
-                                        max_gen_tokens_val.clone().into_int().unwrap_or_default(),
-                                    ) as usize;
-                                }
-                            }
-                            match entry_table.get("max_context_len") {
-                                None => {}
-                                Some(max_context_len_val) => {
-                                    llm_gen.num_context = max(
-                                        0,
-                                        max_context_len_val.clone().into_int().unwrap_or_default(),
-                                    ) as usize;
-                                }
-                            }
-                            match entry_table.get("min_gap_btwn_rqsts_secs") {
-                                None => {}
-                                Some(min_gap_btwn_rqsts_secs_val) => {
-                                    llm_gen.min_gap_btwn_rqsts_secs = max(
-                                        0,
-                                        min_gap_btwn_rqsts_secs_val
-                                            .clone()
-                                            .into_int()
-                                            .unwrap_or_default(),
-                                    )
-                                        as u64;
-                                }
-                            }
-                            match entry_table.get("temperature") {
-                                None => {}
-                                Some(temperature_val) => {
-                                    llm_gen.model_temperature =
-                                        temperature_val.clone().into_float().unwrap_or_default();
-                                }
-                            }
-                            match entry_table.get("api_url") {
-                                None => {}
-                                Some(api_url_val) => {
-                                    llm_gen.svc_base_url =
-                                        api_url_val.clone().into_string().unwrap_or_default();
-                                }
-                            }
-                            match entry_table.get("model_name") {
-                                None => {}
-                                Some(model_name_val) => {
-                                    llm_gen.model_name =
-                                        model_name_val.clone().into_string().unwrap_or_default();
-                                }
-                            }
-                            match entry_table.get("model_api_timeout") {
-                                None => {}
-                                Some(model_api_timeout_val) => {
-                                    llm_gen.fetch_timeout = max(
-                                        0,
-                                        model_api_timeout_val.clone().into_int().unwrap_or_default(),
-                                    ) as u64;
-                                }
-                            }
-                            return Some(llm_gen);
-                        }
-                        Err(er) => {
-                            error!("{}", er.to_string());
-                        }
-                    }
-                }
-            }else{
+        let config_table = match app_config.get_table("llm_apis") {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Config: missing [llm_apis] table: {e}");
                 return None;
             }
+        };
+
+        let entry = match config_table.get(llm_svc_name) {
+            Some(v) => v.clone(),
+            None => {
+                error!("Config: no entry for '{llm_svc_name}' in [llm_apis]");
+                return None;
+            }
+        };
+
+        let table = match entry.into_table() {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Config: [llm_apis.\"{llm_svc_name}\"] is not a table: {e}");
+                return None;
+            }
+        };
+
+        info!("Loading LLM config for '{llm_svc_name}'");
+
+        macro_rules! get_int {
+            ($key:literal, $field:ident) => {
+                if let Some(v) = table.get($key) {
+                    llm_gen.$field = max(0, v.clone().into_int().unwrap_or_default()) as _;
+                }
+            };
         }
-        None
+        macro_rules! get_float {
+            ($key:literal, $field:ident) => {
+                if let Some(v) = table.get($key) {
+                    llm_gen.$field = v.clone().into_float().unwrap_or_default();
+                }
+            };
+        }
+        macro_rules! get_string {
+            ($key:literal, $field:ident) => {
+                if let Some(v) = table.get($key) {
+                    llm_gen.$field = v.clone().into_string().unwrap_or_default();
+                }
+            };
+        }
+
+        get_string!("model_name", model_name);
+        get_string!("api_url", svc_base_url);
+        get_float!("temperature", model_temperature);
+        get_int!("max_gen_tokens", max_tok_gen);
+        get_int!("max_context_len", num_context);
+        get_int!("min_gap_btwn_rqsts_secs", min_gap_btwn_rqsts_secs);
+        get_int!("model_api_timeout", fetch_timeout);
+
+        if let Some(v) = table.get("system_prompt")
+            && let Ok(s) = v.clone().into_string()
+            && !s.is_empty()
+        {
+            llm_gen.system_prompt = Some(s);
+        }
+
+        Some(llm_gen)
     }
 }
 
+// ── HTTP client factory ───────────────────────────────────────────────────────
+
+/// Build a blocking `reqwest::Client` with the given settings.
 pub fn build_llm_api_client(
     connect_timeout: u64,
     fetch_timeout: u64,
     proxy_url: Option<String>,
     custom_headers: Option<HeaderMap>,
 ) -> reqwest::blocking::Client {
-    let pool_idle_timeout: u64 = (connect_timeout + fetch_timeout) * 5;
-    let pool_max_idle_connections: usize = 1;
+    let pool_idle_timeout = (connect_timeout + fetch_timeout) * 5;
 
-    let mut headers = HeaderMap::new();
-    if let Some(custom_header_map) = custom_headers {
-        headers = custom_header_map;
-    }
-    // prepare headers:
+    let mut headers = custom_headers.unwrap_or_default();
     headers.insert(
         reqwest::header::CONNECTION,
         HeaderValue::from_static("keep-alive"),
@@ -416,109 +420,27 @@ pub fn build_llm_api_client(
         HeaderValue::from_static("application/json"),
     );
 
-    // build client:
-    let client_builder = reqwest::blocking::Client::builder()
+    let builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(fetch_timeout))
         .connect_timeout(Duration::from_secs(connect_timeout))
         .default_headers(headers)
         .gzip(true)
         .pool_idle_timeout(Duration::from_secs(pool_idle_timeout))
-        .pool_max_idle_per_host(pool_max_idle_connections);
-    if proxy_url.is_some() {
-        if let Some(proxy_url_str) = proxy_url {
-            // if proxy is configured, then add proxy with https rule:
-            match reqwest::Proxy::https(proxy_url_str.as_str()) {
-                Ok(proxy_obj) => {
-                    let client: reqwest::blocking::Client = client_builder
-                        .proxy(proxy_obj)
-                        .build()
-                        .expect("Require valid parameters for building HTTP client");
-                    return client;
-                }
-                Err(e) => {
-                    error!(
-                        "Unable to use proxy, Error when setting the proxy server: {}",
-                        e
-                    );
-                }
+        .pool_max_idle_per_host(1);
+
+    let builder = if let Some(proxy_str) = proxy_url {
+        match reqwest::Proxy::https(&proxy_str) {
+            Ok(proxy) => builder.proxy(proxy),
+            Err(e) => {
+                error!("Cannot configure proxy '{proxy_str}': {e}");
+                builder
             }
         }
-    }
-    let client_no_proxy: reqwest::blocking::Client = client_builder
+    } else {
+        builder
+    };
+
+    builder
         .build()
-        .expect("Require valid parameters for building REST API client");
-    client_no_proxy
+        .expect("Failed to build HTTP client — check system TLS configuration")
 }
-
-#[derive(Serialize, Deserialize, PartialEq, Default)]
-pub struct LlmApiResult {
-    // The text generated by the model
-    pub generated_text: String,
-    // The count of input tokens used up for the ptompt / text generation input
-    pub input_tokens_count: u64,
-    // The count of generated tokens
-    pub output_tokens_count: u64,
-    // The reason for stopping text generation
-    pub stop_reason: String,
-    // The model used for geneeration
-    pub model_used: String,
-    // The log probabilities of the tokens generated.
-    // Convert to linear probabilities = round(exp(logprob) * 100, 2)
-    pub logprobs: Vec<f64>,
-}
-
-impl LlmApiResult {
-    pub fn from(
-        generated_text: String,
-        input_tokens_count: u64,
-        output_tokens_count: u64,
-        stop_reason: String,
-        model_used: String,
-    ) -> LlmApiResult {
-        LlmApiResult {
-            generated_text,
-            input_tokens_count,
-            output_tokens_count,
-            stop_reason,
-            model_used,
-            logprobs: vec![],
-        }
-    }
-    pub fn error(error_message: String) -> Result<LlmApiResult, String> {
-        Err(error_message)
-    }
-}
-
-impl fmt::Debug for LlmApiResult {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt.debug_struct("LLM API Result\n")
-            .field(
-                "\nLLM generated text",
-                &format_args!("{}", self.generated_text),
-            )
-            .field(
-                "\nInput tokens",
-                &format_args!("{}", self.input_tokens_count),
-            )
-            .field(
-                "\nOutput tokens",
-                &format_args!("{}", self.output_tokens_count),
-            ) //&format_args!("{}", self.addr))
-            .field(
-                "\nReason to stop generating",
-                &format_args!("{}", self.stop_reason),
-            )
-            .field(
-                "\nModel that generated this text",
-                &format_args!("{}", self.model_used),
-            )
-            .field(
-                "\nLog probabilities of generated tokens",
-                &format_args!("{:?}\n", self.logprobs),
-            )
-            .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {}

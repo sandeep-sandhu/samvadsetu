@@ -1,14 +1,14 @@
 [package]
 name = "samvadsetu"
-version = "0.1.2"
-edition = "2021"
-description = "Simple LLM API for commonly used LLM services including Gemini, ChatGPT, and Ollama. The name implies a bridge for dialogue since the library facilitates communication and interaction between a programs logic and the large language models capabilities. The sanskrit word saṃvāda (संवाद) refers to dialogue, and setu (सेतु) means bridge."
+version = "1.0.0"
+edition = "2024"
+description = "Multi-provider LLM API client for Gemini, ChatGPT, Claude, DeepSeek, Qwen, Ollama, and llama.cpp. Supports tool calling, logprobs, structured output, and batch processing. The name implies a bridge for dialogue: Sanskrit saṃvāda (संवाद) = dialogue, setu (सेतु) = bridge."
 repository = "https://github.com/sandeep-sandhu/samvadsetu"
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/sandeep-sandhu/sandeep-sandhu"
+homepage = "https://github.com/sandeep-sandhu/samvadsetu"
 documentation = "https://docs.rs/samvadsetu"
 keywords = ["LLMs", "Language_Models", "API", "gemini", "ollama"]
-categories = ["command-line-utilities", "command-line-interface", "text-processing"]
+categories = ["api-bindings", "text-processing", "web-programming::http-client"]
 readme = "README.md"
 
 [lib]
@@ -16,13 +16,14 @@ name = "samvadsetu"
 path = "src/lib.rs"
 crate-type = ["lib"]
 
-#[[bin]]
-#name="samvadsetu"
-#path = "src/bin.rs"
+[features]
+default = []
+async = ["dep:tokio", "reqwest/default"]
 
 [dependencies]
-log = "0.4.25"
-serde = { version = "1.0.217", features = ["derive"] }
-serde_json = "1.0.135"
-reqwest = { version = "0.12.12", features = ["json", "rustls-tls", "blocking", "http2", "cookies", "gzip"] }
-config = "0.15.6"
+log = "0.4.32"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.13.4", features = ["json", "native-tls", "blocking", "http2", "gzip", "multipart"] }
+config = "0.15.23"
+tokio = { version = "1.52", features = ["full"], optional = true }

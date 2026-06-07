@@ -1,452 +1,581 @@
-use crate::llm::{LLMTextGenerator, LlmApiResult};
-use log::{debug, error};
-use reqwest;
-use reqwest::header::{HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::error::Error;
-use serde_json;
-use serde_json::json;
-
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct GeminiRequestPayload {
-    pub contents: Vec<HashMap<String, Vec<HashMap<String, String>>>>,
-    #[serde(rename = "safetySettings")]
-    pub safety_settings: Vec<HashMap<String, String>>,
-    #[serde(rename = "generationConfig")]
-    pub generation_config: HashMap<String, usize>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct GenerationConfig {
-    pub temperature: usize,
-    #[serde(rename = "maxOutputTokens")]
-    pub max_output_tokens: usize,
-    pub response_modalities: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Parts {
-    pub text: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Contents {
-    pub role: String,
-    pub parts: Parts,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct GoogleGenAIRequestPayload {
-    pub contents: Contents,
-    #[serde(rename = "safety_settings")]
-    pub safety_settings: Vec<HashMap<String, String>>,
-    pub generation_config: GenerationConfig,
-}
-
-/// Add headers for google gen ai api:
-/// "x-goog-api-key: PUT-YOUR-API-KEY-HERE"
-/// "Content-Type: application/json"
-///
-/// # Arguments
-///
-/// * `app_config`: The application configuration
-///
-/// returns: HeaderMap<HeaderValue>
-pub fn prepare_googlegenai_headers(api_key: String) -> HeaderMap {
-    let mut custom_headers = HeaderMap::new();
-    const GOOG_API_HEADER: reqwest::header::HeaderName =
-        reqwest::header::HeaderName::from_static("x-goog-api-key");
-
-    if let Ok(header_apikey_val) = HeaderValue::from_str(api_key.as_str()) {
-        custom_headers.insert(GOOG_API_HEADER, header_apikey_val);
-    }
-    custom_headers.insert(
-        reqwest::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    custom_headers
-}
-
-
-/// Prepare the JSON payload for sending to the Google GenAI API.
-///
-/// # Arguments
-///
-/// * `prompt`: The prompt to the model.
-/// * `llm_params`: the LLMParameters struct with various params, e.g. temperature, num_ctx, max_gen
-///
-/// returns: RequestPayload
-pub fn prepare_google_genai_api_payload(
-    prompt: String,
-    llm_params: &LLMTextGenerator,
-) -> serde_json::Value
-{
-
-    let safety_filer = "BLOCK_NONE";
-    // safety settings can be one of: "BLOCK_NONE", "BLOCK_ONLY_HIGH", etc.
-    // tok K parameter can be specified in generationconfig as: "top_k": 64,
-    // for json, set this in generationconfig: "response_mime_type": "application/json"
-    // enforce json schema by adding to generationconfig:
-    // response_schema = {
-    //     "type": "ARRAY",
-    //     "items": {
-    //         "type": "OBJECT",
-    //         "properties": {
-    //             "timestamp": {"type": "STRING"},
-    //             "error_code": {"type": "INTEGER"},
-    //             "error_message": {"type": "STRING"},
-    //         },
-    //         "required": ["timestamp", "error_message", "error_code"],
-    //     },
-    // }
-
-    json!(
-        {
-            "system_instruction": {
-                "parts": {
-                    "text": llm_params.system_context
-                }
-            },"contents": {
-                "role": "USER",
-                "parts": {
-                    "text": prompt,
-                },
-            },
-            "safety_settings": [
-                {
-                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                    "threshold": safety_filer,
-                },
-            ],
-            "generation_config": {
-                "temperature": llm_params.model_temperature as usize,
-                "max_output_tokens": llm_params.max_tok_gen,
-                "response_modalities": "TEXT",
-            },
-        }
-    )
-}
-
-/// Prepare the JSON payload for sending to the Gemini LLM API service.
-///
-/// # Arguments
-///
-/// * `prompt`: The prompt to the model.
-/// * `llm_params`: the LLMParameters struct with various params, e.g. temperature, num_ctx, max_gen
-///
-/// returns: RequestPayload
-pub fn prepare_gemini_api_payload(
-    prompt: String,
-    llm_params: &LLMTextGenerator,
-) -> GeminiRequestPayload {
-    // put the parameters into the structure
-    GeminiRequestPayload {
-        contents: vec![HashMap::from([(
-            "parts".to_string(),
-            vec![HashMap::from([("text".to_string(), prompt)])],
-        )])],
-        safety_settings: vec![HashMap::from([
-            (
-                "category".to_string(),
-                "HARM_CATEGORY_DANGEROUS_CONTENT".to_string(),
-            ),
-            ("threshold".to_string(), "BLOCK_ONLY_HIGH".to_string()),
-        ])],
-        generation_config: HashMap::from([
-            (
-                "temperature".to_string(),
-                llm_params.model_temperature as usize,
-            ),
-            ("maxOutputTokens".to_string(), llm_params.max_tok_gen),
-        ]),
-    }
-}
-
-
-// Prepare and execute an HTTP post request for text generation from Google's GenAI API
-// Generate URL of the format: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent
+// providers/google.rs — Google Gemini API (legacy key-in-URL) + Google GenAI API
 //
-pub fn http_post_json_google_genai(
-    llm_params: &LLMTextGenerator,
-    client: &reqwest::blocking::Client,
-    json_payload: serde_json::Value //GoogleGenAIRequestPayload,
-) -> Result<LlmApiResult, String> {
-    let api_url = format!(
-        "{}/{}:generateContent",
-        llm_params.svc_base_url, llm_params.model_name
-    );
+// Two endpoint variants:
+//  • "gemini"      — legacy, API key as ?key= query param
+//  • "google_genai" — newer, API key as x-goog-api-key header
+// Both use the same response format and share response-parsing logic.
 
-    // add json payload to body
-    match client.post(api_url).json(&json_payload).send() {
-        Ok(resp) => {
-            match resp.status() {
-                reqwest::StatusCode::OK => {
-                    match resp.json::<serde_json::value::Value>() {
-                        Ok(json) => {
-                            debug!("Google GenAI API response:\n{:?}", json);
-                            return extract_results_from_json(&json, "Google GenAI API");
-                        }
-                        Err(e) => {
-                            error!("When retrieving json from Google GenAI API response: {}", e);
-                            if let Some(err_source) = e.source() {
-                                error!("Caused by: {}", err_source);
-                                return Err(format!(
-                                    "Google GenAI error: {}, caused by {}",
-                                    e,
-                                    err_source
-                                ));
+use crate::error::{from_reqwest_error, SamvadSetuError};
+use crate::llm::LLMTextGenerator;
+use crate::types::{
+    ChatMessage, LlmApiResult, MessageContent, ResponseFormat, Role, StopReason, ToolCall,
+    ToolDefinition, TokenLogprob, TopTokenAlternative,
+};
+use log::debug;
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue};
+use serde_json::{json, Value};
+
+// ── Header helpers ────────────────────────────────────────────────────────────
+
+pub fn prepare_googlegenai_headers(api_key: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Ok(hv) = HeaderValue::from_str(api_key)
+        && let Ok(name) = reqwest::header::HeaderName::from_bytes(b"x-goog-api-key")
+    {
+        headers.insert(name, hv);
+    }
+    headers
+}
+
+// ── Payload helpers ───────────────────────────────────────────────────────────
+
+/// Convert our `ChatMessage` slice into Gemini's `contents` array.
+/// Returns (system_instruction_text, contents_array).
+fn build_gemini_contents(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
+    let system: Option<String> = {
+        let parts: Vec<_> = messages
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .filter_map(|m| m.text().map(str::to_string))
+            .collect();
+        if parts.is_empty() { None } else { Some(parts.join("\n")) }
+    };
+
+    let contents: Vec<Value> = messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .map(|msg| {
+            let role = match msg.role {
+                Role::User | Role::Tool => "user",
+                Role::Assistant => "model",
+                Role::System => "user",
+            };
+
+            let parts: Value = match &msg.content {
+                MessageContent::Text(text) => {
+                    if msg.role == Role::Tool {
+                        // Tool result → functionResponse part
+                        json!([{
+                            "functionResponse": {
+                                "name": msg.name.as_deref().unwrap_or("unknown"),
+                                "id": msg.tool_call_id.as_deref().unwrap_or(""),
+                                "response": {
+                                    "content": text
+                                }
                             }
-                        }
+                        }])
+                    } else {
+                        json!([{"text": text}])
                     }
                 }
-                reqwest::StatusCode::UNAUTHORIZED => {
-                    error!("Google GenAI API: Unauthorised!");
-                    return Err("Google GenAI API: Unauthorised".to_string());
+                MessageContent::ToolCalls(calls) => {
+                    let parts: Vec<Value> = calls
+                        .iter()
+                        .map(|tc| {
+                            json!({
+                                "functionCall": {
+                                    "id": tc.id,
+                                    "name": tc.name,
+                                    "args": tc.arguments
+                                }
+                            })
+                        })
+                        .collect();
+                    json!(parts)
                 }
-                reqwest::StatusCode::NOT_FOUND => {
-                    error!("Google GenAI API: Service not found!");
-                    return Err("Google GenAI API: Service not found".to_string());
-                }
-                reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
-                    error!("Google GenAI API: Request payload is too large!");
-                    return Err("Google GenAI API: Request payload is too large".to_string());
-                }
-                reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                    error!(
-                        "Google GenAI API: Too many requests. Exceeded the Provisioned Throughput."
-                    );
-                    return Err(
-                        "Google GenAI API: Too many requests. Exceeded the Provisioned Throughput."
-                            .to_string(),
-                    );
-                }
-                s => {
-                    error!("Google GenAI API response status: {s:?}");
-                    return Err(format!(
-                        "Google GenAI error, HTTP response status code: {:?}",
-                        s
-                    ));
+                MessageContent::Blocks(blocks) => {
+                    use crate::types::ContentBlock;
+                    let parts: Vec<Value> = blocks
+                        .iter()
+                        .map(|b| match b {
+                            ContentBlock::Text { text } => json!({"text": text}),
+                            ContentBlock::ToolUse { id, name, input } => json!({
+                                "functionCall": {"id": id, "name": name, "args": input}
+                            }),
+                            ContentBlock::ToolResult { tool_use_id, content, .. } => json!({
+                                "functionResponse": {
+                                    "id": tool_use_id,
+                                    "name": "function",
+                                    "response": {"content": content}
+                                }
+                            }),
+                        })
+                        .collect();
+                    json!(parts)
                 }
             };
-        }
-        Err(e) => {
-            error!(
-                "When posting json payload to Google GenAI API service: {}",
-                e
-            );
-            if let Some(err_source) = e.source() {
-                error!("Caused by: {}", err_source);
-                return Err(format!(
-                    "Google GenAI error: {}, caused by {}",
-                    e,
-                    err_source
-                ));
-            }
-        }
-    }
-    LlmApiResult::error("Google GenAI API: did not generate any text".to_string())
+
+            json!({"role": role, "parts": parts})
+        })
+        .collect();
+
+    (system, contents)
 }
 
-pub fn extract_results_from_json(json: &serde_json::Value, llm_service_name: &str) -> Result<LlmApiResult, String> {
-    let mut llm_response = LlmApiResult::default();
-    if let Some(resp_error) = json.get("error") {
-        if let Some(error_message) = resp_error.get("message") {
-            if let Some(err_message) = error_message.as_str() {
-                error!("{} Error message: {}", llm_service_name, err_message);
-                return Err(format!("{} error: {}", llm_service_name, err_message));
-            }
+/// Build `tools` array in Gemini format.
+fn build_gemini_tools(tools: &[ToolDefinition]) -> Value {
+    let declarations: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters
+            })
+        })
+        .collect();
+    json!([{"functionDeclarations": declarations}])
+}
+
+pub fn prepare_google_genai_payload(
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDefinition]>,
+    response_format: Option<&ResponseFormat>,
+    params: &LLMTextGenerator,
+) -> Value {
+    let (system_text, contents) = build_gemini_contents(messages);
+    let sys = system_text
+        .or_else(|| params.system_prompt.clone())
+        .filter(|s| !s.is_empty());
+
+    let mut generation_config = json!({
+        "temperature": params.model_temperature,
+        "maxOutputTokens": params.max_tok_gen,
+        "responseLogprobs": true,
+        "logprobs": 5
+    });
+
+    match response_format {
+        Some(ResponseFormat::JsonObject) => {
+            generation_config["responseMimeType"] = json!("application/json");
         }
+        Some(ResponseFormat::JsonSchema { schema, .. }) => {
+            generation_config["responseMimeType"] = json!("application/json");
+            generation_config["responseSchema"] = schema.clone();
+        }
+        _ => {}
     }
-    if let Some(resp_candidates) = json.get("candidates") {
-        if let Some(first_candidate) = resp_candidates.get(0) {
-            if let Some(resp_content) = first_candidate.get("content") {
-                if let Some(parts) = resp_content.get("parts") {
-                    if let Some(first_part) = parts.get(0) {
-                        if let Some(text_part) = first_part.get("text") {
-                            llm_response.generated_text =
-                                text_part.to_string();
-                        }
+
+    let mut payload = json!({
+        "contents": contents,
+        "generationConfig": generation_config,
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH",       "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"}
+        ]
+    });
+
+    if let Some(sp) = sys {
+        payload["systemInstruction"] = json!({"parts": [{"text": sp}]});
+    }
+
+    if let Some(td) = tools {
+        payload["tools"] = build_gemini_tools(td);
+        payload["toolConfig"] = json!({
+            "functionCallingConfig": {"mode": "AUTO"}
+        });
+    }
+
+    payload
+}
+
+/// Build legacy Gemini payload (same shape, no system_instruction).
+pub fn prepare_gemini_legacy_payload(
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDefinition]>,
+    params: &LLMTextGenerator,
+) -> Value {
+    prepare_google_genai_payload(messages, tools, None, params)
+}
+
+// ── Response parsing ──────────────────────────────────────────────────────────
+
+pub(crate) fn parse_gemini_response(json: &Value) -> Result<LlmApiResult, SamvadSetuError> {
+    // Error in body
+    if let Some(err) = json.get("error") {
+        return Err(SamvadSetuError::Provider {
+            error_type: "gemini_api_error".to_string(),
+            message: err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown Gemini error")
+                .to_string(),
+            param: None,
+            code: err
+                .get("code")
+                .and_then(|v| v.as_u64())
+                .map(|c| c.to_string()),
+        });
+    }
+
+    let mut result = LlmApiResult::default();
+
+    if let Some(mv) = json.get("modelVersion").and_then(|v| v.as_str()) {
+        result.model_used = mv.to_string();
+    }
+
+    if let Some(usage) = json.get("usageMetadata") {
+        result.input_tokens_count = usage
+            .get("promptTokenCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        result.output_tokens_count = usage
+            .get("candidatesTokenCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+    }
+
+    let candidate = match json.get("candidates").and_then(|c| c.get(0)) {
+        Some(c) => c,
+        None => {
+            return Err(SamvadSetuError::Parse {
+                message: "No candidates in Gemini response".to_string(),
+                raw_response: Some(json.to_string()),
+            })
+        }
+    };
+
+    if let Some(reason) = candidate.get("finishReason").and_then(|v| v.as_str()) {
+        result.stop_reason = match reason {
+            "STOP" => StopReason::Stop,
+            "MAX_TOKENS" => StopReason::MaxTokens,
+            "SAFETY" => StopReason::ContentFilter,
+            other => StopReason::Other(other.to_string()),
+        };
+    }
+
+    if let Some(content) = candidate.get("content")
+        && let Some(parts) = content.get("parts").and_then(|v| v.as_array())
+    {
+        for part in parts {
+                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                    if !result.generated_text.is_empty() {
+                        result.generated_text.push('\n');
                     }
+                    result.generated_text.push_str(text);
+                }
+
+                if let Some(fc) = part.get("functionCall") {
+                    let id = fc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = fc
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                    result.tool_calls.push(ToolCall { id, name, arguments });
                 }
             }
-        }
     }
-    // TODO: get stop_reason:
-    if let Some(resp_usage_metadata) = json.get("usageMetadata") {
-        if let Some(prompt_token_count_str) =
-            resp_usage_metadata.get("promptTokenCount")
-        {
-            llm_response.input_tokens_count =
-                prompt_token_count_str.as_u64().unwrap_or_default();
-        }
-        if let Some(candidates_token_count_str) =
-            resp_usage_metadata.get("candidatesTokenCount")
-        {
-            llm_response.output_tokens_count =
-                candidates_token_count_str.as_u64().unwrap_or_default();
-        }
+
+    if !result.tool_calls.is_empty() {
+        result.stop_reason = StopReason::ToolUse;
     }
-    // "modelVersion"
-    if let Some(model_version_val) = json.get("modelVersion") {
-        llm_response.model_used = model_version_val.to_string();
+
+    // Logprobs (available in newer Gemini models when responseLogprobs=true)
+    if let Some(lp_result) = candidate.get("logprobsResult")
+        && let Some(chosen) = lp_result.get("chosenCandidates").and_then(|v| v.as_array())
+    {
+            let top_candidates: Vec<&Value> = lp_result
+                .get("topCandidates")
+                .and_then(|v| v.as_array())
+                .map(|v| v.iter().collect())
+                .unwrap_or_default();
+
+            for (i, entry) in chosen.iter().enumerate() {
+                let token = entry
+                    .get("token")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let logprob = entry.get("logProbability").and_then(|v| v.as_f64()).unwrap_or(f64::NEG_INFINITY);
+
+                let top_alternatives: Vec<TopTokenAlternative> = top_candidates
+                    .get(i)
+                    .and_then(|tc| tc.get("candidates").and_then(|v| v.as_array()))
+                    .map(|alts| {
+                        alts.iter()
+                            .map(|alt| TopTokenAlternative {
+                                token: alt
+                                    .get("token")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                logprob: alt
+                                    .get("logProbability")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(f64::NEG_INFINITY),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                result.logprobs.push(TokenLogprob {
+                    token,
+                    logprob,
+                    bytes: vec![],
+                    top_alternatives,
+                });
+            }
     }
-    Ok(llm_response)
+
+    Ok(result)
 }
 
-/// Posts the json payload with the prompt to generate text using the Gemini LLM API REST service and retrieves back the result.
-/// Converts the url, model and api key to full url for the api service for non-stream
-/// content generation:
-/// e.g. https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=$GOOGLE_API_KEY
-/// First, the payload is prepared in json format.
-/// Then, it is HTTP POST(ed) to the URL and the response payload is retrieved and converted
-/// from json to struct to extract and return the model generated output text.
-///
-/// # Arguments
-///
-/// * `json_payload`: The prompt + context input to the model service
-/// * `llm_params`: The API parameters to be used, e.g. temperature, max token count, model, etc.
-///
-/// returns: Result
-pub fn http_post_json_gemini(
-    llm_params: &LLMTextGenerator,
-    client: &reqwest::blocking::Client,
-    json_payload: GeminiRequestPayload,
-) -> Result<LlmApiResult, String> {
-    let api_url = format!(
-        "{}/{}:generateContent?key={}",
-        llm_params.svc_base_url, llm_params.model_name, llm_params.api_key
-    );
+// ── HTTP calls ────────────────────────────────────────────────────────────────
 
-    // add json payload to body
-    match client.post(api_url).json(&json_payload).send() {
+fn post_to_gemini(
+    url: &str,
+    client: &Client,
+    payload: &Value,
+    provider_name: &str,
+) -> Result<LlmApiResult, SamvadSetuError> {
+    match client.post(url).json(payload).send() {
         Ok(resp) => {
-            match resp.status() {
-                reqwest::StatusCode::OK => {
-                    match resp.json::<serde_json::value::Value>() {
-                        Ok(json) => {
-                            debug!("Google Gemini API response payload:\n{:?}", json);
-                            return extract_results_from_json(&json, "Gemini API");
-                        }
-                        Err(e) => {
-                            error!("Gemini API: When retrieving json from response: {}", e);
-                            if let Some(err_source) = e.source() {
-                                error!("Caused by: {}", err_source);
-                                return LlmApiResult::error(format!(
-                                    "Gemini API error When retrieving json: {}, caused by: {}",
-                                    e, err_source
-                                ));
-                            }
-                        }
-                    }
-                }
-                reqwest::StatusCode::NOT_FOUND => {
-                    error!("Gemini API: Service not found!");
-                    return LlmApiResult::error("Gemini API: Service not found".to_string());
-                }
-                reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
-                    error!("Gemini API: Request payload is too large!");
-                    return LlmApiResult::error(
-                        "Gemini API: Request payload is too large".to_string(),
-                    );
-                }
-                reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                    error!("Gemini API: Too many requests. Exceeded the Provisioned Throughput.");
-                    return LlmApiResult::error(
-                        "Gemini API: Too many requests. Exceeded the Provisioned Throughput."
-                            .to_string(),
-                    );
-                }
-                s => {
-                    error!("Gemini API: Received response status: {s:?}");
-                    return LlmApiResult::error(format!(
-                        "Gemini API: Received response status: {s:?}"
-                    ));
-                }
+            let status = resp.status();
+            let status_u16 = status.as_u16();
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                let body = resp.text().unwrap_or_default();
+                return Err(SamvadSetuError::RateLimit {
+                    retry_after_secs: retry_after,
+                    message: body,
+                });
             }
-        }
-        Err(e) => {
-            error!("When posting json payload to service: {}", e);
-            if let Some(err_source) = e.source() {
-                error!("Caused by: {}", err_source);
-                return LlmApiResult::error(format!(
-                    "Gemini API: When posting json payload to service error {}, caused by: {}",
-                    e, err_source
-                ));
+
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                let body = resp.text().unwrap_or_default();
+                return Err(SamvadSetuError::Auth(body));
             }
+
+            let body = resp.text().map_err(|e| SamvadSetuError::Network(e.to_string()))?;
+
+            if !status.is_success() {
+                return Err(SamvadSetuError::Http { status: status_u16, body });
+            }
+
+            let json: Value =
+                serde_json::from_str(&body).map_err(|e| SamvadSetuError::Parse {
+                    message: format!("{provider_name} JSON parse: {e}"),
+                    raw_response: Some(body),
+                })?;
+
+            debug!("{provider_name} response: {json:.200}");
+            parse_gemini_response(&json)
         }
+        Err(e) => Err(from_reqwest_error(e)),
     }
-    LlmApiResult::error("Gemini API: did not generate any text".to_string())
 }
+
+/// POST to the legacy Gemini endpoint (`?key=…` auth).
+pub fn http_post_gemini(
+    params: &LLMTextGenerator,
+    client: &Client,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDefinition]>,
+) -> Result<LlmApiResult, SamvadSetuError> {
+    let payload = prepare_gemini_legacy_payload(messages, tools, params);
+    let url = format!(
+        "{}/{}:generateContent?key={}",
+        params.svc_base_url, params.model_name, params.api_key
+    );
+    debug!("Gemini request to {url}");
+    post_to_gemini(&url, client, &payload, "Gemini")
+}
+
+/// POST to the Google GenAI endpoint (`x-goog-api-key` header auth).
+pub fn http_post_google_genai(
+    params: &LLMTextGenerator,
+    client: &Client,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDefinition]>,
+    response_format: Option<&ResponseFormat>,
+) -> Result<LlmApiResult, SamvadSetuError> {
+    let payload =
+        prepare_google_genai_payload(messages, tools, response_format, params);
+    let url = format!(
+        "{}/{}:generateContent",
+        params.svc_base_url, params.model_name
+    );
+    debug!("Google GenAI request to {url}");
+    post_to_gemini(&url, client, &payload, "Google GenAI")
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::llm::LLMTextGenBuilder;
-    use crate::providers::google::prepare_google_genai_api_payload;
+    use crate::types::{ChatMessage, ToolDefinition};
+    use serde_json::json;
 
-    #[test]
-    fn test_generate_using_gemini_llm() {
-        let mut llmgen =
-            LLMTextGenBuilder::build(
-                "gemini",
-                "gemini-1.5-flash-latest",
-                60,
-                None,
-                None
-            ).unwrap();
-        llmgen.max_tok_gen = 16000;
-        /* Disabling since automated CI/CD pipelines do not have network access and fail the test:
-        let answer1 = llmgen.generate_text(
-            "",
-            "How is a rainbow created in the sky? Respond very concisely.",
-        );
-        if let Ok(llm_response) = answer1 {
-            println!("---Answer 1---\n{:?}", llm_response);
-            assert_eq!(true, true);
-        }
-        */
-        assert_eq!(true, true);
+    fn gemini_gen() -> LLMTextGenerator {
+        LLMTextGenBuilder::build("gemini", "gemini-2.0-flash", 60, None, None).unwrap()
+    }
+    fn genai_gen() -> LLMTextGenerator {
+        LLMTextGenBuilder::build("google_genai", "gemini-2.0-flash-exp", 60, None, None).unwrap()
     }
 
     #[test]
-    fn test_generate_using_google_genai_llm() {
-        let mut llmgen =
-            LLMTextGenBuilder::build(
-                "google_genai",
-                "gemini-2.0-flash-exp",
-                60,
-                None,
-                None
-            ).unwrap();
-        llmgen.max_tok_gen = 16000;
-        /* Disabling since automated CI/CD pipelines do not have network access and fail the test:
-        let answer11 = llmgen.generate_text(
-            "",
-            "How is a rainbow created in the sky? Respond very concisely.",
-        );
-        if let Ok(llm_response) = answer11 {
-            println!("---Answer 11---\n{:?}", llm_response);
-            assert_eq!(true, false);
-        }
-        */
-        assert_eq!(true, true);
+    fn test_gemini_payload_has_contents() {
+        let llm_gen = gemini_gen();
+        let msgs = vec![ChatMessage::user("Hello")];
+        let payload = prepare_gemini_legacy_payload(&msgs, None, &llm_gen);
+        assert!(payload["contents"].is_array());
+        assert_eq!(payload["contents"][0]["role"], "user");
     }
 
     #[test]
-    fn test_google_genai_req_payload(){
-        let llm_gen_opt = LLMTextGenBuilder::build(
-            "google_genai",
-            "gemini-flash-2.0",
-            60,
-            None,
-            None
+    fn test_system_becomes_system_instruction() {
+        let llm_gen = genai_gen();
+        let msgs = vec![
+            ChatMessage::system("You are a pirate."),
+            ChatMessage::user("Hello"),
+        ];
+        let payload = prepare_google_genai_payload(&msgs, None, None, &llm_gen);
+        assert!(!payload["systemInstruction"].is_null());
+        let contents = payload["contents"].as_array().unwrap();
+        // System message must not appear in contents
+        assert!(!contents.iter().any(|c| c["role"] == "system"));
+    }
+
+    #[test]
+    fn test_tools_become_function_declarations() {
+        let llm_gen = genai_gen();
+        let msgs = vec![ChatMessage::user("Search for weather")];
+        let tools = vec![ToolDefinition::new(
+            "get_weather",
+            "Get the weather",
+            json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+        )];
+        let payload = prepare_google_genai_payload(&msgs, Some(&tools), None, &llm_gen);
+        assert!(payload["tools"].is_array());
+        let decls = &payload["tools"][0]["functionDeclarations"];
+        assert_eq!(decls[0]["name"], "get_weather");
+    }
+
+    #[test]
+    fn test_json_mode_sets_response_mime_type() {
+        let llm_gen = genai_gen();
+        let msgs = vec![ChatMessage::user("Return JSON")];
+        let payload =
+            prepare_google_genai_payload(&msgs, None, Some(&ResponseFormat::JsonObject), &llm_gen);
+        assert_eq!(
+            payload["generationConfig"]["responseMimeType"],
+            json!("application/json")
         );
-        if let Some(llm_gen) = llm_gen_opt{
-            let user_prompt = "Do this awesome task.";
-            let json = prepare_google_genai_api_payload(user_prompt.to_string(), &llm_gen);
-            println!("{:#?}", json);
-            let user_message = json.get("contents").unwrap().get("parts").unwrap().get("text").unwrap().to_string();
-            assert!(user_message.contains(user_prompt));
+    }
+
+    #[test]
+    fn test_parse_text_candidate() {
+        let json = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "The answer is 42."}]
+                },
+                "finishReason": "STOP"
+            }],
+            "modelVersion": "gemini-2.0-flash",
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "candidatesTokenCount": 5
+            }
+        });
+        let result = parse_gemini_response(&json).unwrap();
+        assert_eq!(result.generated_text, "The answer is 42.");
+        assert_eq!(result.model_used, "gemini-2.0-flash");
+        assert_eq!(result.stop_reason, StopReason::Stop);
+    }
+
+    #[test]
+    fn test_parse_function_call_candidate() {
+        let json = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "id": "fc_001",
+                            "name": "get_weather",
+                            "args": {"city": "Rome"}
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 10}
+        });
+        let result = parse_gemini_response(&json).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        assert_eq!(result.tool_calls[0].arguments["city"], "Rome");
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn test_parse_logprobs_when_present() {
+        let json = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Hi"}]},
+                "finishReason": "STOP",
+                "logprobsResult": {
+                    "chosenCandidates": [
+                        {"token": "Hi", "logProbability": -0.3}
+                    ],
+                    "topCandidates": [
+                        {"candidates": [
+                            {"token": "Hi",    "logProbability": -0.3},
+                            {"token": "Hello", "logProbability": -1.1}
+                        ]}
+                    ]
+                }
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1}
+        });
+        let result = parse_gemini_response(&json).unwrap();
+        assert_eq!(result.logprobs.len(), 1);
+        assert_eq!(result.logprobs[0].token, "Hi");
+        assert_eq!(result.logprobs[0].top_alternatives.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_error_body() {
+        let json = json!({
+            "error": {
+                "code": 400,
+                "message": "API key not valid.",
+                "status": "INVALID_ARGUMENT"
+            }
+        });
+        let err = parse_gemini_response(&json).unwrap_err();
+        match err {
+            SamvadSetuError::Provider { message, .. } => {
+                assert!(message.contains("API key"));
+            }
+            _ => panic!("Expected Provider error"),
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_live_gemini_call() {
+        let llm_gen = gemini_gen();
+        let msgs = vec![ChatMessage::user("What is 1 + 1? Reply with just the number.")];
+        let result = llm_gen.generate_text(&msgs, None, None).unwrap();
+        assert!(result.generated_text.contains('2'));
     }
 }

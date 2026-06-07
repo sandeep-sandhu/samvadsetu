@@ -1,81 +1,63 @@
-//! # SamvadSetu - A library to interface with popular LLM API services
+//! # SamvadSetu — Multi-provider LLM API client
 //!
-//! Rust-native library for integrating with popular LLM API services.
+//! A Rust-native library for sending chat-completion requests to multiple LLM
+//! providers with a single, unified API.  The name is Sanskrit for "dialogue
+//! bridge": saṃvāda (संवाद) = dialogue, setu (सेतु) = bridge.
 //!
-//! This library provides a simple interface for commonly used LLM services including Gemini,
-//! ChatGPT, and self-hosted models such as Ollama.
+//! ## Supported providers
 //!
-//! The name implies a bridge for dialogue since the library facilitates communication and
-//! interaction between a programs logic and the large language models capabilities.
-//! The sanskrit word saṃvāda (संवाद) refers to dialogue, and setu (सेतु) means bridge.
+//! | Provider          | `llm_service` string | Auth env var          |
+//! |-------------------|---------------------|-----------------------|
+//! | OpenAI / ChatGPT  | `"chatgpt"` / `"openai"` | `OPENAI_API_KEY`  |
+//! | DeepSeek          | `"deepseek"`        | `DEEPSEEK_API_KEY`    |
+//! | Alibaba Qwen      | `"qwen"`            | `DASHSCOPE_API_KEY`   |
+//! | llama.cpp server  | `"llamacpp"`        | `LLAMACPP_API_KEY`    |
+//! | Anthropic Claude  | `"claude"` / `"anthropic"` | `ANTHROPIC_API_KEY` |
+//! | Google Gemini     | `"gemini"`          | `GOOGLE_API_KEY`      |
+//! | Google GenAI      | `"google_genai"`    | `GOOGLE_API_KEY`      |
+//! | Ollama            | `"ollama"`          | _(none)_              |
 //!
-//! # Quick Start:
-//! Here is an example to quickly get started:
+//! ## Quick start
 //!
-//! //     use samvadsetu::llm::LLMTextGenerator;
-//! //
-//! //     let config_filename = "examples\\example1.toml";
-//! //
-//! //     if let Ok(app_confg) = Config::builder().add_source(config::File::new(&config_filename, FileFormat::Toml)).build() {
-//! //         println!("Reading from config file: {}", config_filename);
-//! //
-//! //         if let Ok(llm_gen) = LLMTextGenerator::build_from_config(&app_confg, "ollama")
-//! //         {
-//! //             let answer1 = llm_gen.generate_text("", "How is a rainbow created in the sky? Respond very concisely.");
-//! //             if let Ok(llm_response) = answer1 {
-//! //                 println!("---Answer 1---\n{:?}", llm_response);
-//! //                 assert_eq!(true, true);
-//! //             }
-//! //         }
-//! //     }
-//! //
+//! ```rust,no_run
+//! use samvadsetu::llm::LLMTextGenBuilder;
+//! use samvadsetu::types::ChatMessage;
 //!
+//! let llm_gen = LLMTextGenBuilder::build("chatgpt", "gpt-4o-mini", 60, None, None)
+//!     .expect("build failed");
 //!
-//! By default, the api keys for chatgpt and Gemini services are picked up from environment
-//! variables as given in their respective API reference pages:
-//!   - ChatGPT: https://platform.openai.com/docs/api-reference/chat/create
-//!   - Gemini: https://ai.google.dev/gemini-api/docs/quickstart?lang=rest
+//! let msgs = vec![
+//!     ChatMessage::system("You are a helpful assistant."),
+//!     ChatMessage::user("How is a rainbow formed?"),
+//! ];
 //!
-//! # Configuration File
-//! This example assumes the config file (.toml format) has entries like these:
+//! let result = llm_gen.generate_text(&msgs, None, None).expect("API call failed");
+//! println!("{}", result.generated_text);
 //!
-//! <tt>
-//!
-//! [llm_apis."chatgpt"]
-//!
-//! max_context_len = 16384
-//!
-//! max_gen_tokens = 8192
-//!
-//! temperature = 0.0
-//!
-//! model_name = "gpt-4o-mini"
-//!
-//! api_url = "https://api.openai.com/v1/chat/completions"
-//!
-//! model_api_timeout=200
-//!
-//!
-//!
-//! [llm_apis."gemini"]
-//!
-//! max_context_len = 16384
-//!
-//! max_gen_tokens = 8192
-//!
-//! temperature = 0.0
-//!
-//! model_name = "gemini-1.5-flash"
-//!
-//! api_url = "https://generativelanguage.googleapis.com/v1beta/models"
-//!
-//! model_api_timeout=200
-//!
-//! </tt>
+//! // Token-level confidence (hallucination proxy)
+//! if let Some(p) = result.mean_probability() {
+//!     println!("Mean token confidence: {:.1}%", p * 100.0);
+//! }
+//! ```
 
+pub mod error;
 pub mod llm;
+pub mod types;
+
 pub mod providers {
+    pub mod anthropic;
     pub mod google;
     pub mod ollama;
     pub mod openai;
 }
+
+pub mod batch;
+
+// Re-export the most commonly used items at the crate root for convenience.
+pub use error::SamvadSetuError;
+pub use llm::{LLMTextGenBuilder, LLMTextGenerator};
+pub use types::{
+    BatchHandle, BatchRequest, BatchRequestResult, BatchStatus, ChatMessage, ContentBlock,
+    LlmApiResult, MessageContent, ResponseFormat, Role, StopReason, TokenLogprob, ToolCall,
+    ToolDefinition, TopTokenAlternative,
+};
